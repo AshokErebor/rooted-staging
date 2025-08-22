@@ -4,7 +4,6 @@ const {
   getDataByQuery,
   createRecord,
   getUserDetails,
-  formatDateCustom,
   parseCreatedOn,
 } = require("../services/cosmosService");
 const {
@@ -48,7 +47,7 @@ async function findOrderByUser(container, id, role, offset, limit) {
         return [];
     }
     const querySpec = {
-      query: `SELECT * FROM c WHERE ${userId} = @id OFFSET @offset LIMIT @limit`,
+      query: `SELECT * FROM c WHERE ${userId} = @id ORDER BY c.createdOn DESC OFFSET @offset LIMIT @limit`,
       parameters: [
         { name: "@id", value: id },
         { name: "@offset", value: offset },
@@ -82,9 +81,9 @@ async function createOrder(orderDetails) {
   const { createPayment } = require("../utils/PhonePe");
   try {
     const orderContainer = getContainer(ContainerIds.Order);
-    if (orderDetails.orderType == "Subscription") {
+    if (orderDetails.orderType == orderCategoriesMap.subscriptions) {
       await orderContainer.items.create(orderDetails);
-      return new responseModel(true, "Order created successfully", {
+      return new responseModel(true, orderMessages.success, {
         orderId: newOrder.id,
       });
     }
@@ -94,7 +93,9 @@ async function createOrder(orderDetails) {
 
     if (orderDetails.scheduledDelivery) {
       orderType =
-        orderDetails.orderType == "Subscription" ? "Subscription" : "Scheduled";
+        orderDetails.orderType == orderMessages.types.subscription
+          ? orderMessages.types.subscription
+          : orderCategoriesMap.scheduled;
     }
 
     let productDetails = await getProductDetails(
@@ -103,24 +104,17 @@ async function createOrder(orderDetails) {
     );
 
     if (productDetails.products.length === 0)
-      return new responseModel(
-        false,
-        "No products found in cart. Please add products to cart first.",
-      );
+      return new responseModel(false, orderMessages.outofstock);
 
     var isOutofStock = productDetails.products.some(
       (p) => p.outOfStock === true,
     );
 
-    if (isOutofStock)
-      return new responseModel(
-        false,
-        "Some products are out of stock. Please check your cart.",
-      );
+    if (isOutofStock) return new responseModel(false, orderMessages.outofstock);
 
     const newOrderId = await getNextOrderId();
     if (!newOrderId) {
-      return new responseModel(false, "Failed to generate new order ID");
+      return new responseModel(false, orderMessages.qrFailed);
     }
 
     if (
@@ -145,11 +139,7 @@ async function createOrder(orderDetails) {
         return new responseModel(false, discountPrice.message);
     }
 
-    var deliveryCharges =
-      orderDetails.storeDetails?.distance >
-      orderDetails.storeDetails?.deliveryRange
-        ? orderDetails.storeDetails.deliveryCharges
-        : 0;
+    var deliveryCharges = orderDetails.storeDetails?.deliveryCharges || 0;
     var packagingCharges = orderDetails.storeDetails?.packagingCharges || 0;
     var platformCharges = orderDetails.storeDetails?.platformCharges || 0;
     const price =
@@ -160,48 +150,52 @@ async function createOrder(orderDetails) {
       discountPrice.discount;
 
     const newOrder = {
-      id: `Order-${newOrderId}`,
+      id: `${orderType[0]}${newOrderId}`,
       customerDetails: orderDetails.customerDetails,
       productDetails: productDetails.products,
       storeDetails: {
         id: orderDetails.storeDetails.id,
         storeName: orderDetails.storeDetails.storeName,
         phone: orderDetails.storeDetails.phone,
-        address: orderDetails.storeDetails.storeAddress,
+        address: orderDetails.storeAddress,
       },
       subscriptionId: orderDetails.subscriptionId,
       scheduledDelivery: orderDetails.scheduledDelivery,
       status: "New",
-      deliveryCharges,
-      packagingCharges,
-      platformCharges,
-      orderPrice: price,
+      priceDetails: {
+        subTotal: productDetails.subTotal,
+        deliveryCharges,
+        packagingCharges,
+        platformCharges,
+        discountPrice: discountPrice.discount,
+        totalPrice: price,
+      },
       couponCode: orderDetails.couponCode,
       orderType,
-      createdOn: formatDateCustom(new Date()),
+      createdOn: orderDetails.createdOn,
       PaymentDetails: {
-        paymentStatus: "PENDING",
+        paymentStatus: orderMessages.types.pending,
         paymentDetails: [],
       },
       storeAdminId: orderDetails.storeDetails.storeAdminId || "",
     };
 
     const paymentUrl = await createPayment(
-      newOrder.orderPrice,
+      price,
       newOrder.id,
-      orderCategoriesMap.quick,
+      newOrder.orderType,
     );
     if (!paymentUrl.success) {
-      return new responseModel(false, "Failed to create payment URL");
+      return new responseModel(false, orderMessages.urlFailed);
     }
-    await orderContainer.items.create(newOrder);
+    await createRecord(orderContainer, newOrder);
     await applyCouponAndUpdate(
       discountPrice,
       orderDetails.customerDetails.customerId,
     );
-    return new responseModel(true, "Order created successfully", {
+    return new responseModel(true, orderMessages.orderCreate, {
       orderId: newOrder.id,
-      paymentUrl,
+      paymentUrl: paymentUrl.response,
     });
   } catch (error) {
     logger.error(commonMessages.errorOccured, error);
@@ -213,28 +207,33 @@ async function getNextOrderId() {
   try {
     const container = getContainer(ContainerIds.Order);
     const counterId = "Orders";
-
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
     const { resource: counterDoc } = await container
       .item(counterId, counterId)
       .read();
 
     let nextId;
-
     if (!counterDoc) {
       nextId = 1;
       const newCounter = {
         id: counterId,
         type: "counter",
+        date: today,
         value: nextId,
       };
       await container.items.create(newCounter);
     } else {
-      nextId = counterDoc.value + 1;
+      if (counterDoc.date === today) {
+        nextId = counterDoc.value + 1;
+      } else {
+        nextId = 1;
+        counterDoc.date = today;
+      }
       counterDoc.value = nextId;
       await container.item(counterId, counterId).replace(counterDoc);
     }
-
-    return nextId;
+    const orderId = `${today}ORD${nextId}`;
+    return orderId;
   } catch (error) {
     logger.error(commonMessages.errorOccured, error);
     return null;
@@ -361,41 +360,6 @@ const updateProductPrices = async (productDetails) => {
     return updatedProductDetails;
   } catch (error) {
     logger.error(commonMessages.errorOccured, error);
-  }
-};
-
-const createReOrder = async (orderDetails) => {
-  try {
-    const container = getContainer(ContainerIds.Order);
-    const newOrderId = await getNextOrderId();
-    const newOrder = {
-      id: `Order-${newOrderId}`,
-      customerDetails: {
-        customerId: orderDetails.customerDetails.customerId,
-        address: orderDetails.customerDetails.customerAddress,
-      },
-      productDetails: orderDetails.productDetails,
-      storeId: orderDetails.storeId,
-      storeAdminId: orderDetails.storeDetails?.storeAdminId || "",
-      subscriptionId: orderDetails.subscriptionId,
-      status: orderMessages.types.new,
-      deliveryCharges: orderDetails.deliveryCharges,
-      packagingCharges: orderDetails.packagingCharges,
-      platformCharges: orderDetails.platformCharges,
-      IsReplacement: true,
-      orderPrice: orderDetails.price,
-      couponUsed: "",
-      orderType: orderMessages.types.quick,
-      createdOn: formatDateCustom(new Date()),
-    };
-
-    //const {resource : createdOrder} = await container.items.create(newOrder);
-    const createdOrder = await createRecord(container, newOrder);
-
-    return new responseModel(true, orderMessages.placed, createdOrder);
-  } catch (error) {
-    logger.error(commonMessages.errorOccured, error);
-    return new responseModel(false, error.message);
   }
 };
 
@@ -538,9 +502,10 @@ async function createSubscription(
   userId,
   phone,
   couponCode,
+  address,
 ) {
   const { createPayment } = require("../utils/PhonePe");
-
+  const { convertUTCtoIST } = require("../utils/schedules");
   try {
     // Validate inputs
     if (
@@ -549,6 +514,7 @@ async function createSubscription(
     ) {
       return new responseModel(false, commonMessages.badRequest);
     }
+
     const dt = dayjs(scheduledDelivery);
     const day = dt.format("dddd");
     const weekdays = commonMessages.days;
@@ -599,16 +565,25 @@ async function createSubscription(
       if (!discountPrice.success)
         return new responseModel(false, discountPrice.message);
     }
+    const totalPrice =
+      productDetails.subTotal * weeksCount - discountPrice.discount;
+    const today = convertUTCtoIST(new Date().toISOString());
     const deliveryTime = dt.format("HH:mm:ss");
     const newSubscription = {
       id: uuidv4(),
       phone,
       products: productDetails.products,
-      storeDetails,
+      storeDetails: {
+        id: storeDetails.id,
+        storeName: storeDetails.storeName,
+        phone: storeDetails.phone,
+        address: storeDetails.storeAddress,
+      },
       customerDetails: {
         customerId: userId,
-        address: customerDetails.addresses[0],
+        address,
         Name: customerDetails.name,
+        phone,
       },
       subscriptionOrderDates: [],
       pendingOrderDates: pendingDates,
@@ -617,16 +592,24 @@ async function createSubscription(
       weeksCount,
       deliveryTime,
       payments: [],
-      totalPrice: productDetails.subTotal * weeksCount - discountPrice.discount,
+      couponCode,
+      priceDetails: {
+        discountPrice: discountPrice.discount,
+        subTotal: `${productDetails.subTotal} * ${weeksCount}`,
+        deliveryCharges: 0,
+        packagingCharges: 0,
+        platformCharges: 0,
+        totalPrice,
+      },
       storeAdminId: storeDetails?.storeAdminId || "",
-      createdDate: new Date().toISOString().slice(0, 16),
+      createdDate: today,
     };
 
     // Create payment request
     const paymentUrl = await createPayment(
-      newSubscription.totalPrice,
+      totalPrice,
       newSubscription.id,
-      "Subscriptions",
+      orderCategoriesMap.subscriptions,
     );
 
     if (!paymentUrl || !paymentUrl.success) {
@@ -659,7 +642,6 @@ module.exports = {
   createOrder,
   getProductDetails,
   updateProductPrices,
-  createReOrder,
   scheduledDelivery,
   getNextOrderId,
   getEnrichedProductDetails,
