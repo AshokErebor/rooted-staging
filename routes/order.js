@@ -13,7 +13,6 @@ const {
   getContainer,
   getDetailsById,
   updateRecord,
-  formatDateCustom,
   getDataByQuery,
 } = require("../services/cosmosService");
 const responseModel = require("../models/ResponseModel");
@@ -23,8 +22,9 @@ const {
   orderMessages,
   roles,
 } = require("../constants");
-const { getNearestStore } = require("../services/mapService");
+const { getNearestStore, getCurentArea } = require("../services/mapService");
 const { logger } = require("../jobLogger");
+const { convertUTCtoIST } = require("../utils/schedules");
 
 const router = express.Router();
 const orderContainer = getContainer(ContainerIds.Order);
@@ -40,12 +40,26 @@ router.post("/createOrder", authenticateToken, async (req, res) => {
       isSubscription,
       weeksCount,
     } = req.body;
-
     if (!customerAddress)
       return res
         .status(400)
         .json(new responseModel(false, commonMessages.badRequest));
+    let scheduledDate = "";
+    if (scheduledDelivery) {
+      scheduledDate = convertUTCtoIST(scheduledDelivery);
+      if (scheduledDate < new Date().toISOString()) {
+        return res
+          .status(400)
+          .json(new responseModel(false, orderMessages.scheduleMessage));
+      }
+    }
     const customerDetails = await getDetailsById(customerContainer, userId);
+    let address = customerDetails.addresses.find(
+      (addr) => addr.origin === customerAddress,
+    );
+    if (!address) {
+      address = await getCurentArea(customerAddress);
+    }
     const storeDetails = await getNearestStore(customerAddress);
     if (isSubscription) {
       if (!weeksCount || !scheduledDelivery)
@@ -57,10 +71,11 @@ router.post("/createOrder", authenticateToken, async (req, res) => {
         customerDetails,
         storeDetails,
         weeksCount,
-        scheduledDelivery,
+        scheduledDate,
         userId,
         phone,
         couponCode,
+        address,
       );
 
       if (response.error)
@@ -72,16 +87,17 @@ router.post("/createOrder", authenticateToken, async (req, res) => {
       phone,
       customerDetails: {
         customerId: userId,
-        address: customerDetails.addresses[0],
+        address,
         Name: customerDetails.name,
+        phone,
       },
       storeDetails: storeDetails,
       subscriptionId: "",
-      scheduledDelivery,
+      scheduledDelivery: scheduledDate,
       orderType: orderMessages.types.quick,
       couponCode,
       storeAdminId: storeDetails?.storeAdminId || "",
-      createdOn: formatDateCustom(new Date()),
+      createdOn: convertUTCtoIST(new Date().toISOString()),
     };
 
     const result = await createOrder(orderDetails);
@@ -227,7 +243,7 @@ router.post("/return/:orderId", authenticateToken, async (req, res) => {
 
     item.returnCause = returnCause;
     item.orderReattempt = reorder;
-    item.returnOn = formatDateCustom(new Date());
+    item.returnOn = convertUTCtoIST(new Date());
     item.status = status;
 
     const updatedOrder = await updateRecord(orderContainer, item);
